@@ -174,8 +174,6 @@ presubmits:
     rerun_command: "/test unit"
     always_run: true
     trigger: "((?m)^/test( all| unit),?(\\s+|$))"
-    decorate: true
-    skip_cloning: true
     spec:
       serviceAccountName: ci-operator
       containers:
