@@ -38,7 +38,8 @@ type templateExecutionStep struct {
 }
 
 const (
-	showOutputAnnotation string = "ci-operator.openshift.io/always-show-output"
+	showOutputAnnotation          string = "ci-operator.openshift.io/always-show-output"
+	showContainerOutputAnnotation string = "ci-operator.openshift.io/always-show-container-output"
 )
 
 func (s *templateExecutionStep) Inputs(ctx context.Context, dry bool) (api.InputDefinition, error) {
@@ -808,20 +809,11 @@ func podLogNewContainers(podClient coreclientset.PodInterface, pod *coreapi.Pod,
 		completed[status.Name] = s.FinishedAt.Time
 		notifier.Notify(pod, status.Name)
 
-		if pod.ObjectMeta.Annotations[showOutputAnnotation] != "true" && s.ExitCode == 0 {
-			log.Printf("Container %s in pod %s completed successfully", status.Name, pod.Name)
-			continue
-		}
-
-		if s, err := podClient.GetLogs(pod.Name, &coreapi.PodLogOptions{
-			Container: status.Name,
-		}).Stream(); err == nil {
-			if _, err := io.Copy(os.Stdout, s); err != nil {
-				log.Printf("error: Unable to copy log output from failed pod container %s: %v", status.Name, err)
+		containersToOutput := getContainersMap(strings.Split(pod.ObjectMeta.Annotations[showContainerOutputAnnotation], ","))
+		if _, exists := containersToOutput[status.Name]; pod.ObjectMeta.Annotations[showOutputAnnotation] == "true" || s.ExitCode != 0 || exists {
+			if err := printLogsToStdout(podClient, status.Name, pod.Name); err != nil {
+				log.Printf("%v", err)
 			}
-			s.Close()
-		} else {
-			log.Printf("error: Unable to retrieve logs from failed pod container %s: %v", status.Name, err)
 		}
 
 		if status.State.Terminated.ExitCode != 0 {
@@ -829,10 +821,31 @@ func podLogNewContainers(podClient coreclientset.PodInterface, pod *coreapi.Pod,
 		} else {
 			log.Printf("Container %s in pod %s completed successfully", status.Name, pod.Name)
 		}
-
 	}
 	// if there are no running containers and we're in a terminal state, mark the pod complete
 	if (pod.Status.Phase == coreapi.PodFailed || pod.Status.Phase == coreapi.PodSucceeded) && len(podRunningContainers(pod)) == 0 {
 		notifier.Complete(pod.Name)
 	}
+}
+
+func printLogsToStdout(podClient coreclientset.PodInterface, statusName, podName string) error {
+	if s, err := podClient.GetLogs(podName, &coreapi.PodLogOptions{
+		Container: statusName,
+	}).Stream(); err == nil {
+		if _, err := io.Copy(os.Stdout, s); err != nil {
+			return fmt.Errorf("error: Unable to copy log output from failed pod container %s: %v", statusName, err)
+		}
+		s.Close()
+	} else {
+		return fmt.Errorf("error: Unable to retrieve logs from failed pod container %s: %v", statusName, err)
+	}
+	return nil
+}
+
+func getContainersMap(containers []string) map[string]struct{} {
+	c := make(map[string]struct{}, len(containers))
+	for _, container := range containers {
+		c[container] = struct{}{}
+	}
+	return c
 }

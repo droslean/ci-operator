@@ -111,3 +111,8 @@ before gathering the artifacts.
 `ci-operator.openshift.io/always-show-output`:
 Will output the logs of all the containers in the pod, no matter what the exit code was.
 The value should be `true` to enable this feature.
+
+`ci-operator.openshift.io/always-show-container-output`:
+Will output the logs of a list of containers in the pod, no matter what the exit code was.
+To specify multiple containers the value should be split by `,`. example: `setup,teardown,test`
+This annotation will be overridden if the `ci-operator.openshift.io/always-show-output` is `true`.
