@@ -103,16 +103,12 @@ the `Template`. Failures to retrieve or upload artifacts will not impact the
 overall result of the job.
 
 ## `Pod`'s annotations
+* To specify multiple containers, the value should be split by `,`. example: `"setup,teardown"`
 
 `ci-operator.openshift.io/wait-for-container-artifacts`:
 Will wait for a completion of a container, that has been specified in its value,
 before gathering the artifacts.
 
 `ci-operator.openshift.io/always-show-output`:
-Will output the logs of all the containers in the pod, no matter what the exit code was.
-The value should be `true` to enable this feature.
-
-`ci-operator.openshift.io/always-show-container-output`:
-Will output the logs of a list of containers in the pod, no matter what the exit code was.
-To specify multiple containers the value should be split by `,`. example: `setup,teardown,test`
-This annotation will be overridden if the `ci-operator.openshift.io/always-show-output` is `true`.
+Will output the logs of the specified containers, if the pod fails.
+By default, only the logs of failed containers will be output.

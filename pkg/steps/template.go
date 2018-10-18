@@ -38,8 +38,7 @@ type templateExecutionStep struct {
 }
 
 const (
-	showOutputAnnotation          string = "ci-operator.openshift.io/always-show-output"
-	showContainerOutputAnnotation string = "ci-operator.openshift.io/always-show-container-output"
+	showOutputAnnotation string = "ci-operator.openshift.io/always-show-output"
 )
 
 func (s *templateExecutionStep) Inputs(ctx context.Context, dry bool) (api.InputDefinition, error) {
@@ -587,12 +586,15 @@ func waitForPodCompletionOrTimeout(podClient coreclientset.PodInterface, name st
 	if pod.Spec.RestartPolicy == coreapi.RestartPolicyAlways {
 		return false, nil
 	}
-	podLogNewContainers(podClient, pod, completed, notifier)
+	podLogNewFailedContainers(podClient, pod, completed, notifier)
 	if podJobIsOK(pod) {
 		log.Printf("Pod %s already succeeded in %s", pod.Name, podDuration(pod).Truncate(time.Second))
 		return false, nil
 	}
 	if podJobIsFailed(pod) {
+		if err := outputAnnotatedContainerLogs(podClient, pod); err != nil {
+			log.Printf("%v", err)
+		}
 		return false, appendLogToError(fmt.Errorf("the pod %s/%s failed after %s (failed containers: %s): %s", pod.Namespace, pod.Name, podDuration(pod).Truncate(time.Second), strings.Join(failedContainerNames(pod), ", "), podReason(pod)), podMessages(pod))
 	}
 
@@ -612,18 +614,21 @@ func waitForPodCompletionOrTimeout(podClient coreclientset.PodInterface, name st
 			return true, nil
 		}
 		if pod, ok := event.Object.(*coreapi.Pod); ok {
-			podLogNewContainers(podClient, pod, completed, notifier)
+			podLogNewFailedContainers(podClient, pod, completed, notifier)
 			if podJobIsOK(pod) {
 				log.Printf("Pod %s succeeded after %s", pod.Name, podDuration(pod).Truncate(time.Second))
 				return false, nil
 			}
 			if podJobIsFailed(pod) {
+				if err := outputAnnotatedContainerLogs(podClient, pod); err != nil {
+					log.Printf("%v", err)
+				}
 				return false, appendLogToError(fmt.Errorf("the pod %s/%s failed after %s (failed containers: %s): %s", pod.Namespace, pod.Name, podDuration(pod).Truncate(time.Second), strings.Join(failedContainerNames(pod), ", "), podReason(pod)), podMessages(pod))
 			}
 			continue
 		}
 		if event.Type == watch.Deleted {
-			podLogNewContainers(podClient, pod, completed, notifier)
+			podLogNewFailedContainers(podClient, pod, completed, notifier)
 			return false, appendLogToError(fmt.Errorf("the pod %s/%s was deleted without completing after %s (failed containers: %s)", pod.Namespace, pod.Name, podDuration(pod).Truncate(time.Second), strings.Join(failedContainerNames(pod), ", ")), podMessages(pod))
 		}
 		log.Printf("error: Unrecognized event in watch: %v %#v", event.Type, event.Object)
@@ -793,7 +798,7 @@ func failedContainerNames(pod *coreapi.Pod) []string {
 	return names
 }
 
-func podLogNewContainers(podClient coreclientset.PodInterface, pod *coreapi.Pod, completed map[string]time.Time, notifier ContainerNotifier) {
+func podLogNewFailedContainers(podClient coreclientset.PodInterface, pod *coreapi.Pod, completed map[string]time.Time, notifier ContainerNotifier) {
 	var statuses []coreapi.ContainerStatus
 	statuses = append(statuses, pod.Status.InitContainerStatuses...)
 	statuses = append(statuses, pod.Status.ContainerStatuses...)
@@ -809,26 +814,25 @@ func podLogNewContainers(podClient coreclientset.PodInterface, pod *coreapi.Pod,
 		completed[status.Name] = s.FinishedAt.Time
 		notifier.Notify(pod, status.Name)
 
-		containersToOutput := getContainersMap(strings.Split(pod.ObjectMeta.Annotations[showContainerOutputAnnotation], ","))
-		if _, exists := containersToOutput[status.Name]; pod.ObjectMeta.Annotations[showOutputAnnotation] == "true" || s.ExitCode != 0 || exists {
-			if err := printLogsToStdout(podClient, status.Name, pod.Name); err != nil {
-				log.Printf("%v", err)
-			}
+		if s.ExitCode == 0 {
+			log.Printf("Container %s in pod %s completed successfully", status.Name, pod.Name)
+			continue
 		}
 
-		if status.State.Terminated.ExitCode != 0 {
-			log.Printf("Container %s in pod %s failed, exit code %d, reason %s", status.Name, pod.Name, status.State.Terminated.ExitCode, status.State.Terminated.Reason)
-		} else {
-			log.Printf("Container %s in pod %s completed successfully", status.Name, pod.Name)
+		if err := printContainerLogsToStdout(podClient, status.Name, pod.Name); err != nil {
+			log.Printf("%v", err)
 		}
+
+		log.Printf("Container %s in pod %s failed, exit code %d, reason %s", status.Name, pod.Name, status.State.Terminated.ExitCode, status.State.Terminated.Reason)
 	}
+
 	// if there are no running containers and we're in a terminal state, mark the pod complete
 	if (pod.Status.Phase == coreapi.PodFailed || pod.Status.Phase == coreapi.PodSucceeded) && len(podRunningContainers(pod)) == 0 {
 		notifier.Complete(pod.Name)
 	}
 }
 
-func printLogsToStdout(podClient coreclientset.PodInterface, statusName, podName string) error {
+func printContainerLogsToStdout(podClient coreclientset.PodInterface, statusName, podName string) error {
 	if s, err := podClient.GetLogs(podName, &coreapi.PodLogOptions{
 		Container: statusName,
 	}).Stream(); err == nil {
@@ -842,10 +846,30 @@ func printLogsToStdout(podClient coreclientset.PodInterface, statusName, podName
 	return nil
 }
 
-func getContainersMap(containers []string) map[string]struct{} {
-	c := make(map[string]struct{}, len(containers))
-	for _, container := range containers {
+func getContainersMap(containers string) map[string]struct{} {
+	s := strings.Split(containers, ",")
+	c := make(map[string]struct{}, len(s))
+	for _, container := range s {
 		c[container] = struct{}{}
 	}
 	return c
+}
+
+func outputAnnotatedContainerLogs(podClient coreclientset.PodInterface, pod *coreapi.Pod) error {
+	var statuses []coreapi.ContainerStatus
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+	containersToOutput := getContainersMap(pod.ObjectMeta.Annotations[showOutputAnnotation])
+
+	for _, status := range statuses {
+		if s := status.State.Terminated; s != nil {
+			if _, exists := containersToOutput[status.Name]; exists {
+				log.Printf("Container %s logs:", status.Name)
+				if err := printContainerLogsToStdout(podClient, status.Name, pod.Name); err != nil {
+					return fmt.Errorf("%v", err)
+				}
+			}
+		}
+	}
+	return nil
 }
