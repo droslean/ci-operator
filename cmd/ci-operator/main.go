@@ -24,6 +24,7 @@ import (
 	rbacapi "k8s.io/api/rbac/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	coreclientset "k8s.io/client-go/kubernetes/typed/core/v1"
 	rbacclientset "k8s.io/client-go/kubernetes/typed/rbac/v1"
 	"k8s.io/client-go/rest"
@@ -35,9 +36,11 @@ import (
 
 	imageapi "github.com/openshift/api/image/v1"
 	projectapi "github.com/openshift/api/project/v1"
+	routev1 "github.com/openshift/api/route/v1"
 	templateapi "github.com/openshift/api/template/v1"
 	imageclientset "github.com/openshift/client-go/image/clientset/versioned/typed/image/v1"
 	"github.com/openshift/client-go/project/clientset/versioned"
+	routeclientset "github.com/openshift/client-go/route/clientset/versioned"
 	templatescheme "github.com/openshift/client-go/template/clientset/versioned/scheme"
 
 	"github.com/openshift/ci-operator/pkg/api"
@@ -200,6 +203,7 @@ type options struct {
 	clusterConfig *rest.Config
 
 	givePrAuthorAccessToNamespace bool
+	exposeTemplatePod             bool
 	impersonateUser               string
 }
 
@@ -241,6 +245,7 @@ func bindOptions(flag *flag.FlagSet) *options {
 	flag.StringVar(&opt.gitRef, "git-ref", "", "Populate the job spec from this local Git reference. If JOB_SPEC is set, the refs field will be overwritten.")
 	flag.BoolVar(&opt.givePrAuthorAccessToNamespace, "give-pr-author-access-to-namespace", false, "Give view access to the temporarily created namespace to the PR author.")
 	flag.StringVar(&opt.impersonateUser, "as", "", "Username to impersonate")
+	flag.BoolVar(&opt.exposeTemplatePod, "expose-template-pod", false, "Expose the template's pod by creating a service and two routes for ports 8080 and 8443.")
 
 	return opt
 }
@@ -357,6 +362,8 @@ func (o *options) Complete() error {
 			template.Name = filepath.Base(path)
 			template.Name = strings.TrimSuffix(template.Name, filepath.Ext(template.Name))
 		}
+
+		template.ObjectLabels = map[string]string{"ci-operator.openshift.io/template-name": template.Name}
 		o.templates = append(o.templates, template)
 	}
 
@@ -599,6 +606,17 @@ func (o *options) initializeNamespace() error {
 	client, err := coreclientset.NewForConfig(o.clusterConfig)
 	if err != nil {
 		return fmt.Errorf("could not get core client for cluster config: %v", err)
+	}
+
+	routeClient, err := routeclientset.NewForConfig(o.clusterConfig)
+	if err != nil {
+		return fmt.Errorf("could not get route client for cluster config: %v", err)
+	}
+
+	if o.exposeTemplatePod {
+		if err := createTemplateServiceAndRoutes(client, routeClient, o.templates, o.namespace); err != nil {
+			log.Printf("warning: %v", err)
+		}
 	}
 
 	updates := map[string]string{}
@@ -932,4 +950,71 @@ func eventRecorder(kubeClient *coreclientset.CoreV1Client, namespace string) rec
 		Interface: coreclientset.New(kubeClient.RESTClient()).Events("")})
 	return eventBroadcaster.NewRecorder(
 		templatescheme.Scheme, coreapi.EventSource{Component: namespace})
+}
+
+func createTemplateServiceAndRoutes(client *coreclientset.CoreV1Client, routeClient *routeclientset.Clientset, templates []*templateapi.Template, namespace string) error {
+	for _, template := range templates {
+		s := &coreapi.Service{
+			ObjectMeta: meta.ObjectMeta{
+				Name: template.Name,
+			},
+			Spec: coreapi.ServiceSpec{
+				PublishNotReadyAddresses: true,
+				Selector:                 map[string]string{"ci-operator.openshift.io/template-name": template.Name},
+				Type:                     coreapi.ServiceTypeClusterIP,
+				Ports: []coreapi.ServicePort{
+					{
+						Name:       "http",
+						Protocol:   "TCP",
+						Port:       80,
+						TargetPort: intstr.FromInt(8080),
+					},
+					{
+						Name:       "https",
+						Protocol:   "TCP",
+						Port:       443,
+						TargetPort: intstr.FromInt(8443),
+					}}}}
+
+		if _, err := client.Services(namespace).Create(s); err != nil {
+			return fmt.Errorf("could not create service %s: %v", template.Name, err)
+		}
+
+		// Create 8080 Route
+		if _, err := routeClient.Route().Routes(namespace).Create(&routev1.Route{
+			ObjectMeta: meta.ObjectMeta{
+				Name: fmt.Sprintf("%s-8080-route", template.Name),
+			},
+			Spec: routev1.RouteSpec{
+				TLS: &routev1.TLSConfig{
+					Termination: "passthrough",
+				},
+				To: routev1.RouteTargetReference{Name: template.Name},
+				Port: &routev1.RoutePort{
+					TargetPort: intstr.FromInt(8080),
+				},
+			},
+		}); err != nil && !kerrors.IsAlreadyExists(err) {
+			return fmt.Errorf("could not create route %s-8080-route: %v", template.Name, err)
+		}
+
+		// Create 8443 Route
+		if _, err := routeClient.Route().Routes(namespace).Create(&routev1.Route{
+			ObjectMeta: meta.ObjectMeta{
+				Name: fmt.Sprintf("%s-8443-route", template.Name),
+			},
+			Spec: routev1.RouteSpec{
+				TLS: &routev1.TLSConfig{
+					Termination: "passthrough",
+				},
+				To: routev1.RouteTargetReference{Name: template.Name},
+				Port: &routev1.RoutePort{
+					TargetPort: intstr.FromInt(8443),
+				},
+			},
+		}); err != nil && !kerrors.IsAlreadyExists(err) {
+			return fmt.Errorf("could not create route %s-8443-route: %v", template.Name, err)
+		}
+	}
+	return nil
 }
